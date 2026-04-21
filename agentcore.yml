@@ -1,0 +1,33 @@
+apiVersion: bedrock-agentcore/v1
+kind: Runtime
+metadata:
+  name: gemini-voice-agent
+  description: "Speech-to-speech agent using Gemini Live Pro"
+spec:
+  image:
+    repository: your-account.dkr.ecr.us-west-2.amazonaws.com/gemini-voice-agent
+    tag: latest
+  
+  resources:
+    memory: 2Gi
+    cpu: 1000m
+  
+  environment:
+    - name: GEMINI_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: gemini-credentials
+          key: api-key
+  
+  networking:
+    protocols:
+      - websocket
+      - http
+    
+  runtime:
+    maxSessionDuration: 3600  # 1 hour
+    idleTimeout: 300         # 5 minutes
+    
+  observability:
+    enabled: true
+    logLevel: INFO

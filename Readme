@@ -1,0 +1,25 @@
+# Set environment variables
+export GEMINI_API_KEY="your-gemini-api-key"
+export AWS_REGION="us-west-2"
+
+# Create ECR repository
+aws ecr create-repository --repository-name gemini-voice-agent --region us-west-2
+
+# Deploy the agent
+python deploy.py
+
+# Test the deployment
+python -c "
+from bedrock_agentcore.runtime import AgentCoreRuntimeClient
+import asyncio
+
+async def test():
+    client = AgentCoreRuntimeClient(region='us-west-2')
+    response = await client.invoke_agent_runtime(
+        runtime_arn='your-runtime-arn',
+        input_text='Hello, can you hear me?'
+    )
+    print(response)
+
+asyncio.run(test())
+"
