@@ -240,11 +240,13 @@
         class GeminiVoiceClient {
             constructor() {
                 this.websocket = null;
-                this.mediaRecorder = null;
                 this.audioContext = null;
                 this.isRecording = false;
                 this.mediaStream = null;
-                this.vadAudioContext = null;
+                this.captureContext = null;
+                this.sourceNode = null;
+                this.processorNode = null;
+                this.silentGainNode = null;
                 this.analyser = null;
                 this.vadData = null;
                 this.vadTimer = null;
@@ -254,6 +256,7 @@
                 this.speechThreshold = 8;
                 this.silenceMsToEndTurn = 900;
                 this.minGapBetweenTurnsMs = 600;
+                this.targetSampleRate = 24000;
             }
             
             async connect() {
@@ -309,17 +312,36 @@
                     });
 
                     this.mediaStream = stream;
-                    this.mediaRecorder = new MediaRecorder(stream);
                     this.isRecording = true;
+                    this.captureContext = new (window.AudioContext || window.webkitAudioContext)({
+                        sampleRate: this.targetSampleRate
+                    });
 
-                    this.mediaRecorder.ondataavailable = (event) => {
-                        if (event.data.size > 0) {
-                            this.sendAudio(event.data);
+                    this.sourceNode = this.captureContext.createMediaStreamSource(stream);
+
+                    // ScriptProcessor is widely supported for quick PCM capture.
+                    this.processorNode = this.captureContext.createScriptProcessor(4096, 1, 1);
+                    this.processorNode.onaudioprocess = (event) => {
+                        if (!this.isRecording) {
+                            return;
                         }
+                        const input = event.inputBuffer.getChannelData(0);
+                        this.sendAudio(input, event.inputBuffer.sampleRate);
                     };
 
-                    this.setupVAD(stream);
-                    this.mediaRecorder.start(100);
+                    this.analyser = this.captureContext.createAnalyser();
+                    this.analyser.fftSize = 1024;
+                    this.vadData = new Uint8Array(this.analyser.frequencyBinCount);
+
+                    this.silentGainNode = this.captureContext.createGain();
+                    this.silentGainNode.gain.value = 0;
+
+                    this.sourceNode.connect(this.analyser);
+                    this.sourceNode.connect(this.processorNode);
+                    this.processorNode.connect(this.silentGainNode);
+                    this.silentGainNode.connect(this.captureContext.destination);
+
+                    this.setupVAD();
                     updateStatus('recording', 'Live mic on <span class="recording-indicator"></span>');
                     recordBtn.disabled = true;
                     stopBtn.disabled = false;
@@ -331,14 +353,7 @@
                 }
             }
 
-            setupVAD(stream) {
-                this.vadAudioContext = new (window.AudioContext || window.webkitAudioContext)();
-                const source = this.vadAudioContext.createMediaStreamSource(stream);
-                this.analyser = this.vadAudioContext.createAnalyser();
-                this.analyser.fftSize = 1024;
-                this.vadData = new Uint8Array(this.analyser.frequencyBinCount);
-                source.connect(this.analyser);
-
+            setupVAD() {
                 this.vadTimer = window.setInterval(() => {
                     if (!this.isRecording || !this.analyser) {
                         return;
@@ -366,8 +381,7 @@
             }
             
             stopRecording() {
-                if (this.mediaRecorder && this.isRecording) {
-                    this.mediaRecorder.stop();
+                if (this.isRecording) {
                     this.isRecording = false;
                     this.endTurn();
                     updateStatus('connected', 'Connected');
@@ -380,9 +394,26 @@
                     clearInterval(this.vadTimer);
                     this.vadTimer = null;
                 }
-                if (this.vadAudioContext) {
-                    this.vadAudioContext.close();
-                    this.vadAudioContext = null;
+                if (this.processorNode) {
+                    this.processorNode.disconnect();
+                    this.processorNode.onaudioprocess = null;
+                    this.processorNode = null;
+                }
+                if (this.sourceNode) {
+                    this.sourceNode.disconnect();
+                    this.sourceNode = null;
+                }
+                if (this.analyser) {
+                    this.analyser.disconnect();
+                    this.analyser = null;
+                }
+                if (this.silentGainNode) {
+                    this.silentGainNode.disconnect();
+                    this.silentGainNode = null;
+                }
+                if (this.captureContext) {
+                    this.captureContext.close();
+                    this.captureContext = null;
                 }
                 if (this.mediaStream) {
                     this.mediaStream.getTracks().forEach((track) => track.stop());
@@ -390,16 +421,71 @@
                 }
             }
             
-            async sendAudio(audioBlob) {
+            downsampleBuffer(float32Buffer, inputSampleRate, outputSampleRate) {
+                if (inputSampleRate === outputSampleRate) {
+                    return float32Buffer;
+                }
+                if (outputSampleRate > inputSampleRate) {
+                    return float32Buffer;
+                }
+
+                const sampleRateRatio = inputSampleRate / outputSampleRate;
+                const newLength = Math.round(float32Buffer.length / sampleRateRatio);
+                const result = new Float32Array(newLength);
+                let offsetResult = 0;
+                let offsetBuffer = 0;
+
+                while (offsetResult < result.length) {
+                    const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+                    let accum = 0;
+                    let count = 0;
+                    for (let i = offsetBuffer; i < nextOffsetBuffer && i < float32Buffer.length; i++) {
+                        accum += float32Buffer[i];
+                        count += 1;
+                    }
+                    result[offsetResult] = count > 0 ? (accum / count) : 0;
+                    offsetResult += 1;
+                    offsetBuffer = nextOffsetBuffer;
+                }
+
+                return result;
+            }
+
+            floatTo16BitPCM(float32Buffer) {
+                const pcmBuffer = new ArrayBuffer(float32Buffer.length * 2);
+                const view = new DataView(pcmBuffer);
+                for (let i = 0; i < float32Buffer.length; i++) {
+                    const s = Math.max(-1, Math.min(1, float32Buffer[i]));
+                    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+                }
+                return new Uint8Array(pcmBuffer);
+            }
+
+            uint8ToBase64(uint8Array) {
+                let binary = '';
+                const chunkSize = 0x8000;
+                for (let i = 0; i < uint8Array.length; i += chunkSize) {
+                    const chunk = uint8Array.subarray(i, i + chunkSize);
+                    binary += String.fromCharCode.apply(null, chunk);
+                }
+                return btoa(binary);
+            }
+
+            sendAudio(float32Chunk, inputSampleRate) {
                 try {
-                    const arrayBuffer = await audioBlob.arrayBuffer();
-                    const base64Audio = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+                    if (!this.websocket || this.websocket.readyState !== WebSocket.OPEN) {
+                        return;
+                    }
+
+                    const downsampled = this.downsampleBuffer(float32Chunk, inputSampleRate, this.targetSampleRate);
+                    const pcm16 = this.floatTo16BitPCM(downsampled);
+                    const base64Audio = this.uint8ToBase64(pcm16);
                     
                     this.websocket.send(JSON.stringify({
                         type: 'audio',
                         audio: base64Audio,
-                        format: 'webm',
-                        sample_rate: 24000
+                        format: 'pcm16',
+                        sample_rate: this.targetSampleRate
                     }));
                     
                 } catch (error) {
