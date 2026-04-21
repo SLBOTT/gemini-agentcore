@@ -33,7 +33,7 @@ class GeminiLiveClient:
             # Send setup message
             setup_message = {
                 "setup": {
-                    "model": "models/gemini-3.1-flash-live",
+                    "model": "models/gemini-2.5-flash-native-audio-latest",
                     "generation_config": {
                         "response_modalities": ["AUDIO"],
                         "speech_config": {
